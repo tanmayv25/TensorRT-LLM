@@ -378,6 +378,15 @@ commands:
         is_flag: true
         flags:
         - "--openengine-enable-load-metrics"
+      openengine_health_stall_timeout_seconds:
+        type: float
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-health-stall-timeout-seconds"
       otlp_traces_endpoint:
         type: str
         default: null

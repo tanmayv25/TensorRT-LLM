@@ -1221,6 +1221,13 @@ def launch_visual_gen_server(
     "Expose per-rank KV occupancy for OpenEngine routing, independently of KV events.",
     status="prototype")
 @stability_option(
+    "--openengine-health-stall-timeout-seconds",
+    type=click.FloatRange(min=5.0, min_open=True),
+    default=None,
+    help=
+    "Fail OpenEngine liveness if executor health checks do not complete within this many seconds (default: 600).",
+    status="prototype")
+@stability_option(
     "--served_model_name",
     type=str,
     default=None,
@@ -1321,6 +1328,7 @@ def serve(
     grpc: bool,
     grpc_protocol: str,
     openengine_enable_load_metrics: bool,
+    openengine_health_stall_timeout_seconds: Optional[float],
     enable_visual_gen: bool,
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
@@ -1352,6 +1360,11 @@ def serve(
                                            or grpc_protocol != "openengine"):
         raise click.UsageError(
             "--openengine-enable-load-metrics requires --grpc --grpc-protocol openengine"
+        )
+    if openengine_health_stall_timeout_seconds is not None and (
+            not grpc or grpc_protocol != "openengine"):
+        raise click.UsageError(
+            "--openengine-health-stall-timeout-seconds requires --grpc --grpc-protocol openengine"
         )
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1612,7 +1625,9 @@ def serve(
                         served_model_name=served_model_name,
                         report_failure=_report_observed_child_failure,
                         enable_load_metrics=openengine_enable_load_metrics,
-                        subagent_affinity_auth_key=internal_disagg_auth_key)
+                        subagent_affinity_auth_key=internal_disagg_auth_key,
+                        health_stall_timeout_seconds=
+                        openengine_health_stall_timeout_seconds)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

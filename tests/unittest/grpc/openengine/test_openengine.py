@@ -151,6 +151,7 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
     import tensorrt_llm.grpc.openengine.server as oe_server
 
     monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_TIMEOUT_SECONDS", 0.05)
     engine = {"healthy": False}
     llm = SimpleNamespace(
         args=SimpleNamespace(guided_decoding_backend=None),
@@ -160,7 +161,9 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
     )
 
     async def exercise_server() -> None:
-        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        server = OpenEngineServer(
+            "127.0.0.1", 0, llm, "test-model", health_stall_timeout_seconds=0.15
+        )
         await server.start()
         try:
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
@@ -175,6 +178,8 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
                 assert await check("liveness") == health_pb2.HealthCheckResponse.SERVING
                 assert await check("inference") == health_pb2.HealthCheckResponse.NOT_SERVING
                 assert await check("") == health_pb2.HealthCheckResponse.NOT_SERVING
+                await asyncio.sleep(0.2)
+                assert await check("liveness") == health_pb2.HealthCheckResponse.SERVING
                 with pytest.raises(grpc.aio.AioRpcError) as unknown:
                     await check("unknown")
                 assert unknown.value.code() == grpc.StatusCode.NOT_FOUND
@@ -315,6 +320,69 @@ def test_inference_health_timeout_does_not_start_overlapping_checks(
                     ).status == health_pb2.HealthCheckResponse.SERVING
                 finally:
                     stream.cancel()
+        finally:
+            release.set()
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
+def test_health_stall_budget_fails_liveness_without_revival(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung engine check eventually requires restart, even if it finishes late."""
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_TIMEOUT_SECONDS", 0.05)
+    release = threading.Event()
+    calls = 0
+
+    def check_health() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            release.wait(5)
+        return True
+
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _check_health=check_health,
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer(
+            "127.0.0.1", 0, llm, "test-model", health_stall_timeout_seconds=0.15
+        )
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                inference = health.Watch(health_pb2.HealthCheckRequest(service="inference"))
+                liveness = health.Watch(health_pb2.HealthCheckRequest(service="liveness"))
+                try:
+                    for stream in (inference, liveness):
+                        assert (
+                            await asyncio.wait_for(stream.read(), 5)
+                        ).status == health_pb2.HealthCheckResponse.SERVING
+                    assert (
+                        await asyncio.wait_for(inference.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await asyncio.wait_for(liveness.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    release.set()
+                    await asyncio.sleep(0.1)
+                    for service in ("inference", "liveness"):
+                        response = await health.Check(
+                            health_pb2.HealthCheckRequest(service=service), timeout=5
+                        )
+                        assert response.status == health_pb2.HealthCheckResponse.NOT_SERVING
+                finally:
+                    inference.cancel()
+                    liveness.cancel()
         finally:
             release.set()
             await server.stop(grace=0)

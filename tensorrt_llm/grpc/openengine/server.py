@@ -6,11 +6,13 @@
 import asyncio
 import gc
 import ipaddress
+import math
 import os
 import signal
 import socket
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -45,6 +47,7 @@ __all__ = ["OpenEngineServer", "launch_server"]
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 _HEALTH_CHECK_INTERVAL_SECONDS = 1.0
 _HEALTH_CHECK_TIMEOUT_SECONDS = 5.0
+_DEFAULT_HEALTH_STALL_TIMEOUT_SECONDS = 600.0
 _SERVER_OPTIONS = [
     ("grpc.max_receive_message_length", _MAX_MESSAGE_BYTES),
     ("grpc.max_send_message_length", _MAX_MESSAGE_BYTES),
@@ -97,6 +100,7 @@ class OpenEngineServer:
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
+        health_stall_timeout_seconds: Maximum time without a completed executor health check.
     """
 
     def __init__(
@@ -109,7 +113,17 @@ class OpenEngineServer:
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
         subagent_affinity_auth_key: str | None = None,
+        health_stall_timeout_seconds: float | None = None,
     ) -> None:
+        timeout = (
+            _DEFAULT_HEALTH_STALL_TIMEOUT_SECONDS
+            if health_stall_timeout_seconds is None
+            else health_stall_timeout_seconds
+        )
+        if not math.isfinite(timeout) or timeout <= _HEALTH_CHECK_TIMEOUT_SECONDS:
+            raise ValueError(
+                "OpenEngine health stall timeout must exceed the individual health check timeout"
+            )
         self.host = host
         self.port = port
         self._llm = llm
@@ -118,6 +132,8 @@ class OpenEngineServer:
         self._health_task: asyncio.Task | None = None
         self._engine_health_task: asyncio.Task[bool] | None = None
         self._health_refresh_lock = asyncio.Lock()
+        self._health_stall_timeout_seconds = timeout
+        self._health_stall_started_at: float | None = None
         self._inference_serving = False
         self._engine_healthy = False
         self._fatal_engine_failure = False
@@ -184,7 +200,8 @@ class OpenEngineServer:
             ready = False
             if not self._stopping:
                 try:
-                    ready = await self._check_engine_health()
+                    if not self._fatal_engine_failure:
+                        ready = await self._check_engine_health()
                     self._engine_healthy = ready
                     if ready and self._frontend is not None:
                         status = await self._frontend.request("status")
@@ -213,6 +230,8 @@ class OpenEngineServer:
                 await self._health.set("liveness", health_pb2.HealthCheckResponse.NOT_SERVING)
 
     async def _check_engine_health(self) -> bool:
+        if self._health_stall_expired():
+            return False
         task = self._engine_health_task
         if task is not None:
             if not task.done():
@@ -221,15 +240,29 @@ class OpenEngineServer:
             # The timed-out result is stale; start a fresh check instead.
             task.exception()
 
+        started_at = time.monotonic()
         task = asyncio.create_task(asyncio.to_thread(self._control._engine_is_healthy))
         self._engine_health_task = task
         task.add_done_callback(self._consume_engine_health_result)
         done, _ = await asyncio.wait((task,), timeout=_HEALTH_CHECK_TIMEOUT_SECONDS)
         if not done:
+            if self._health_stall_started_at is None:
+                self._health_stall_started_at = started_at
+            self._health_stall_expired()
             logger.warning("OpenEngine inference health check timed out")
             return False
         self._engine_health_task = None
+        self._health_stall_started_at = None
         return task.result()
+
+    def _health_stall_expired(self) -> bool:
+        since = self._health_stall_started_at
+        if since is None or time.monotonic() - since < self._health_stall_timeout_seconds:
+            return False
+        if not self._fatal_engine_failure:
+            logger.error("OpenEngine health check stall budget exhausted")
+        self._fatal_engine_failure = True
+        return True
 
     @staticmethod
     def _consume_engine_health_result(task: asyncio.Task[bool]) -> None:
@@ -286,6 +319,7 @@ def launch_server(
     report_failure: Callable[[int, str, str], None] | None = None,
     enable_load_metrics: bool = False,
     subagent_affinity_auth_key: str | None = None,
+    health_stall_timeout_seconds: float | None = None,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -297,6 +331,7 @@ def launch_server(
         report_failure: Records a child exit before startup readiness.
         enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
+        health_stall_timeout_seconds: Maximum time without a completed executor health check.
     """
 
     async def serve() -> None:
@@ -379,6 +414,9 @@ def launch_server(
                         return
                 if terminal_engine_failure():
                     fail("OpenEngine terminal engine failure")
+                    return
+                if server is not None and server._fatal_engine_failure:
+                    fail("OpenEngine health check stall budget exhausted")
                     return
                 if frontend is not None:
                     try:
@@ -469,6 +507,7 @@ def launch_server(
                 frontend=frontend,
                 instance_id=instance_id,
                 subagent_affinity_auth_key=subagent_affinity_auth_key,
+                health_stall_timeout_seconds=health_stall_timeout_seconds,
             )
             _disable_gc_if_requested()
             await server.start()
